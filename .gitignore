@@ -1,0 +1,10 @@
+# bot.py 运行产物
+__pycache__/
+*.pyc
+venv/
+
+# 本地配置（真实 token 只放这里，不提交）
+.env
+
+# 系统文件
+.DS_Store
