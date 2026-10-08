@@ -1,7 +1,8 @@
 """Telegram bot 主逻辑。
 
 交互：
-  /s <番号>      搜番：封面（遮罩）+ 中文简介 + 磁力 Top5
+  /s <番号>      搜番：封面（遮罩）+ 中文简介 + 磁力 Top3
+  发图片（仅私聊） 以图搜番
   @bot <番号>    任意聊天里内联搜索
 """
 import asyncio
@@ -25,9 +26,12 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 import javdb_client as jdb
@@ -42,6 +46,7 @@ log = logging.getLogger("javdb_bot")
 # ---- 简单内存缓存 & 限流 ----
 _cache: dict[str, tuple[float, dict]] = {}
 _last_query: dict[int, float] = {}
+_last_photo_query: dict[int, float] = {}
 
 
 def _cache_get(key: str):
@@ -73,17 +78,20 @@ HELP_TEXT = """🎬 <b>JavDB 搜番 Bot</b>
 <b>用法</b>
 /s <code>番号</code> — 搜索番号，看简介、封面、磁力
 例：<code>/s MIDA-497</code>
+📷 <b>私聊发图</b> — 以图搜番（仅私聊可用）
 
-💡 在群里也能用，把我拉进群就行（记得在 BotFather 关掉 Privacy Mode）
+💡 在群里也能用 <code>/s</code>，把我拉进群就行（记得在 BotFather 关掉 Privacy Mode）
 💡 任意聊天输入 <code>@本Bot 番号</code> 可内联搜索
+⚠️ 以图搜番图片会发往第三方识别服务
 
-返回内容：遮罩封面 · 中文简介 · 磁力 Top5（中字优先）
+返回内容：遮罩封面 · 中文简介 · 磁力 Top3（中字优先）
 数据来源：JavDB"""
 
 WELCOME_TEXT = """👋 欢迎使用 <b>JavDB 搜番 Bot</b>！
 
 直接发：
 <code>/s MIDA-497</code>
+或者<b>直接发一张图</b>以图搜番（仅私聊）
 
 我会返回遮罩封面、中文简介和磁力链接。
 输入 /help 查看完整说明。"""
@@ -218,8 +226,8 @@ async def _download_cover(movie_number: str, cover_url: str) -> str | None:
         return None
 
 
-async def send_result(update: Update, code: str):
-    msg = update.effective_message
+async def send_result(msg, code: str):
+    """搜番全流程并回复：msg 为要回复的 telegram Message。"""
     thinking = await msg.reply_text(f"🔍 正在搜索 <code>{_esc(code)}</code>…", parse_mode=ParseMode.HTML)
 
     try:
@@ -286,7 +294,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
         return
-    await send_result(update, " ".join(ctx.args))
+    await send_result(update.message, " ".join(ctx.args))
 
 
 async def inline_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -317,6 +325,83 @@ async def inline_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.inline_query.answer(results, cache_time=300)
 
 
+async def photo_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """以图搜番：仅私聊可用，群组里静默忽略（不刷屏）。"""
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    now = time.time()
+    if now - _last_photo_query.get(user_id, 0) < config.PHOTO_RATE_LIMIT_SECONDS:
+        await update.message.reply_text("⏳ 以图搜番冷却中，歇几秒再试。")
+        return
+    _last_photo_query[user_id] = now
+
+    msg = update.effective_message
+    thinking = await msg.reply_text("🔍 以图搜番中…", parse_mode=ParseMode.HTML)
+
+    # 下载最大尺寸的图片到临时目录
+    tmpdir = tempfile.mkdtemp(prefix="jdbimg_")
+    img_path = os.path.join(tmpdir, "query.jpg")
+    try:
+        tg_file = await msg.photo[-1].get_file()
+        await tg_file.download_to_drive(img_path)
+    except Exception as e:
+        log.warning("download tg photo failed: %s", e)
+        await thinking.edit_text("⚠️ 图片下载失败，重发一次试试。")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    try:
+        matches = await jdb.reverse_search(img_path)
+    except Exception:
+        log.exception("reverse search failed")
+        matches = []
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if not matches:
+        await thinking.edit_text("❌ 没识别出来，换张更清晰的图试试。")
+        return
+
+    top = matches[0]
+    # 相似度够高：直接出完整结果
+    if top["similarity"] >= config.PHOTO_SIM_THRESHOLD:
+        await thinking.delete()
+        await send_result(msg, top["code"])
+        return
+
+    # 否则列候选让用户点选
+    kb = [
+        [InlineKeyboardButton(
+            f"🎬 {m['code']}（{m['similarity']:.0f}%）",
+            callback_data=f"pick:{m['code']}",
+        )]
+        for m in matches[:3]
+    ]
+    kb.append([InlineKeyboardButton("❌ 都不是", callback_data="pick:")])
+    await thinking.edit_text(
+        "🔍 识别到以下候选，点一个查看详情：",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def pick_candidate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """用户从以图搜番候选中点选番号。"""
+    query = update.callback_query
+    await query.answer()
+    code = (query.data or "").split(":", 1)[1] if ":" in (query.data or "") else ""
+    # 去掉按钮，避免重复点
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if not code:
+        await query.edit_message_text("已取消。")
+        return
+    await send_result(query.message, code)
+
+
 def main():
     if not config.BOT_TOKEN:
         raise SystemExit("请设置环境变量 BOT_TOKEN（从 @BotFather 获取）")
@@ -324,6 +409,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("s", cmd_search))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_search))
+    app.add_handler(CallbackQueryHandler(pick_candidate, pattern=r"^pick:"))
     app.add_handler(InlineQueryHandler(inline_search))
     log.info("bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

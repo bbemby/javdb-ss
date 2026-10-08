@@ -67,6 +67,42 @@ async def get_magnets(movie_id: str, top_n: int = 5) -> list[dict]:
     return magnets[:top_n]
 
 
+async def reverse_search(image_path: str, limit: int = 3) -> list[dict]:
+    """以图搜番：返回候选列表，每项含 code / similarity / movie_id。
+
+    后端是 AVScan，和 javdb-cli 内置以图搜番同一套。
+    注意：javdb 部分候选失败时会以非 0 退出，但 stdout 仍是有效 JSON，
+    所以这里不走 _run 的严格错误处理，直接解析 stdout。
+    """
+    cmd = [config.JAVDB_BIN, "search", image_path, "--image",
+           "--limit", str(limit), "--json"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), 120)
+        data = json.loads(stdout.decode())
+    except (asyncio.TimeoutError, json.JSONDecodeError, OSError) as e:
+        log.warning("reverse search error: %s", e)
+        return []
+    matches = (data or {}).get("matches") or []
+    out = []
+    for m in matches:
+        cand = m.get("candidate") or {}
+        code = cand.get("video_code") or ""
+        if not code:
+            continue
+        out.append({
+            "code": code,
+            "similarity": float(cand.get("best_similarity") or 0),
+            "movie_id": m.get("movie_id") or "",
+        })
+    return out
+
+
 def magnet_link(m: dict) -> str:
     """从 hash 拼出标准 magnet 链接。"""
     h = m.get("hash") or ""

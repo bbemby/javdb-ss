@@ -28,11 +28,12 @@ Bot：[🔞 遮罩封面，点击查看]
 | 功能 | 说明 |
 |---|---|
 | 🔍 `/s <番号>` | 精确搜番，私聊 / 群组都可用 |
+| 📷 **以图搜番** | **私聊**直接发图识别（群组里不可用，静默忽略） |
 | 🖼️ 遮罩封面 | 封面以 Telegram spoiler 形式发送，点一下才看 |
 | 🌐 中文翻译 | 标题/简介自动 Google 翻译为中文 |
 | 🧲 磁力 Top3 | **中文字幕优先**，同组按体积排序，附名称/大小/标记，一键复制 |
 | ⚡ 内联搜索 | 任意聊天输入 `@你的Bot 番号` 即可搜 |
-| 🛡️ 限流 + 缓存 | 单用户 3 秒冷却，结果缓存 1 小时 |
+| 🛡️ 限流 + 缓存 | 番号搜索 3 秒冷却，以图搜番 10 秒冷却，结果缓存 1 小时 |
 
 ## 🧰 依赖
 
@@ -61,7 +62,9 @@ export BOT_TOKEN="123456:ABC-DEF..."
 | `BOT_TOKEN` | — | **必填**，Telegram Bot Token |
 | `JAVDB_BIN` | `~/bin/javdb` | javdb-cli 路径 |
 | `MAGNET_COUNT` | `3` | 展示的磁力数量 |
-| `RATE_LIMIT_SECONDS` | `3` | 单用户搜索冷却（秒） |
+| `RATE_LIMIT_SECONDS` | `3` | 番号搜索单用户冷却（秒） |
+| `PHOTO_RATE_LIMIT_SECONDS` | `10` | 以图搜番单用户冷却（秒） |
+| `PHOTO_SIM_THRESHOLD` | `75` | 以图搜番相似度阈值，高于此直接出结果 |
 | `CACHE_TTL` | `3600` | 搜索结果缓存（秒） |
 | `TRANS_TARGET` | `zh-CN` | 翻译目标语言 |
 
@@ -94,7 +97,8 @@ systemctl --user enable --now javdb-ss
 ## 🔧 实现细节
 
 - **搜索**：`javdb code <番号>` 精确匹配，失败退化为 `javdb search --zone all` 关键词搜索
-- **封面**：JavDB 图床图片是加密的，直接下载是乱码 —— 用 `javdb assets download` 解密后再上传 TG，`has_spoiler=True` 发送
+- **以图搜番**：`javdb search --image <图> --json`（后端 AVScan），相似度 ≥75% 直接出结果，否则列 Top3 候选按钮；**仅私聊可用**，群组发图静默忽略。注意：javdb 部分候选失败时会非 0 退出但 stdout 仍是有效 JSON，解析时要容忍
+- **封面**：JavDB 图床图片是加密的，直接下载是乱码 —— 用 `javdb assets download` 解密后再上传 TG，`has_spoiler=True` 发送，临时文件发完即删
 - **磁力**：`javdb magnets` 取 hash 拼 `magnet:?xt=urn:btih:`，排序规则：中字优先 → 体积降序
 - **翻译**：Google 免费接口（`translate.googleapis.com/client=gtx`），失败回退原文
 - **注意**：javdb 二进制会在 stdin 阻塞，调用时必须关闭 stdin
